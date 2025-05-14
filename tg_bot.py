@@ -1,9 +1,9 @@
 import os
-import io
-import uuid
 import logging
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+import uuid
+import io
+import base64
+import supabase
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -13,16 +13,16 @@ from telegram import (
 from telegram.ext import (
     Application,
     CommandHandler,
+    ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
+    filters,
     ConversationHandler,
-    ContextTypes,
-    filters
 )
+from fastapi import FastAPI, HTTPException
 from PIL import Image
 import qrcode
-import base64
-import requests
+from dotenv import load_dotenv
 
 from db import (
     create_user_if_not_exists,
@@ -35,10 +35,8 @@ from db import (
     delete_plant,
     set_qr_message_id,
     get_qr_message_id,
-    set_command,
     insert_scan,
-    get_scan_history,
-    clear_command
+    get_scan_history
 )
 from models import ScanData
 
@@ -49,80 +47,124 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-app        = FastAPI()
-app_bot    = Application.builder().token(BOT_TOKEN).build()
-telegram_bot = app_bot.bot
+app = FastAPI()
+
+# Зберігання статусу сканування для кожного робота
+scan_status = {}
 
 SPECIES, LOCATION, BIND_ROBOT = range(3)
 
-
 def get_main_menu():
-    return InlineKeyboardMarkup([
+    keyboard = [
         [InlineKeyboardButton("Запустити сканування", callback_data="start_scan")],
-        [InlineKeyboardButton("Додати рослину",       callback_data="add_plant")],
-        [InlineKeyboardButton("Мої рослини",          callback_data="view_plants")],
-        [InlineKeyboardButton("Перегляд історії",     callback_data="history")],
-    ])
+        [InlineKeyboardButton("Додати рослину", callback_data="add_plant")],
+        [InlineKeyboardButton("Мої рослини", callback_data="view_plants")],
+        [InlineKeyboardButton("Перегляд історії", callback_data="history")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 def plant_list_menu():
-    return InlineKeyboardMarkup([
+    keyboard = [
         [
             InlineKeyboardButton("Повернутися в меню", callback_data="return_menu"),
-            InlineKeyboardButton("Видалити рослину",    callback_data="delete_plant")
+            InlineKeyboardButton("Видалити рослину", callback_data="delete_plant")
         ]
-    ])
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def show_plants_actions(
+    query: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_db_id: str
+) -> bool:
+    plants = get_all_plants(user_db_id)
+    if not plants:
+        await query.message.reply_text(
+            "У вас більше немає доданих рослин.",
+            reply_markup=get_main_menu()
+        )
+        return False
+
+    for p in plants:
+        qr_btn = InlineKeyboardButton(
+            "Показати QR-код",
+            callback_data=f"view_qr:{p['plant_id']}"
+        )
+        await query.message.reply_text(
+            f"Вид: {p['species']}\n"
+            f"Локація: {p['location']}\n"
+            f"Додано: {p['created_at']}",
+            reply_markup=InlineKeyboardMarkup([[qr_btn]])
+        )
+
+    await query.message.reply_text(
+        "Що ви хочете зробити з вашими рослинами?",
+        reply_markup=plant_list_menu()
+    )
+    return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid       = str(update.effective_user.id)
-    username  = update.effective_user.username or ""
-    user_db   = create_user_if_not_exists(tid, username)
-    robot_id  = get_robot_id_for_user(user_db)
+    telegram_id = str(update.effective_user.id)
+    username = update.effective_user.username or ""
+    user_db_id = create_user_if_not_exists(telegram_id, username)
+    robot_id = get_robot_id_for_user(user_db_id)
 
     if not robot_id:
         kb = [[InlineKeyboardButton("Прив'язати робота", callback_data="bind_robot")]]
-        await update.message.reply_text("Вкажіть код вашої машини:", reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(
+            "Для початку роботи необхідно прив'язати робоплатформу.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
         return
-
-    await update.message.reply_text("Оберіть дію:", reply_markup=get_main_menu())
+    await update.message.reply_text(
+        "Вітаю! Це TomatoDiseaseDetector бот. Оберіть дію:",
+        reply_markup=get_main_menu()
+    )
 
 async def start_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("Введіть код вашого робота:")
+    await query.message.reply_text("Введіть ROBOT_ID, який зазначено в інструкції:")
     return BIND_ROBOT
 
 async def bind_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid      = str(update.effective_user.id)
-    user_db  = get_user_db_id(tid)
+    telegram_id = str(update.effective_user.id)
     robot_id = update.message.text.strip()
+    user_db_id = get_user_db_id(telegram_id)
+    if not user_db_id:
+        await update.message.reply_text("Спочатку виконайте /start")
+        return ConversationHandler.END
 
-    bind_robot_to_user(user_db, robot_id)
-    await update.message.reply_text(f"Робота {robot_id} прив'язано!", reply_markup=get_main_menu())
+    bind_robot_to_user(user_db_id, robot_id)
+    scan_status[robot_id] = "stop"  # Ініціалізуємо статус для нового робота
+    await update.message.reply_text(
+        f"Робоплатформу {robot_id} успішно прив’язано!",
+        reply_markup=get_main_menu()
+    )
     return ConversationHandler.END
 
 async def add_plant_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("Назва виду рослини:")
+    await query.message.reply_text("Введіть назву виду Вашої рослини:")
     return SPECIES
 
 async def species_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['species'] = update.message.text
-    await update.message.reply_text("Локація (Ряд 1 Позиція 1):")
+    context.user_data["species"] = update.message.text
+    await update.message.reply_text("Введіть локацію рослини (наприклад, Ряд 1 Позиція 1):")
     return LOCATION
 
 async def location_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid      = str(update.effective_user.id)
-    user_db  = get_user_db_id(tid)
-    species  = context.user_data['species']
+    telegram_id = str(update.effective_user.id)
+    user_db_id = get_user_db_id(telegram_id)
+    species = context.user_data["species"]
     location = update.message.text
     plant_id = str(uuid.uuid4())
+    add_plant(user_db_id, plant_id, species, location)
 
-    add_plant(user_db, plant_id, species, location)
-
-    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
     qr.add_data(plant_id)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
@@ -130,136 +172,241 @@ async def location_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img.save(buf, format="PNG")
     buf.seek(0)
 
-    qr_msg = await update.message.reply_photo(photo=buf,
-        caption=f"Рослина додана!\nВид: {species}\nЛокація: {location}")
+    qr_msg = await update.message.reply_photo(
+        photo=buf,
+        caption=(
+            f"Рослина додана!\n"
+            f"Вид: {species}\n"
+            f"Локація: {location}\n"
+            "Роздрукуйте цей QR-код для сканування."
+        )
+    )
     set_qr_message_id(plant_id, qr_msg.message_id)
 
-    await update.message.reply_text("Готово", reply_markup=get_main_menu())
+    await update.message.reply_text("Виберіть дію:", reply_markup=get_main_menu())
     return ConversationHandler.END
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
+    query = update.callback_query
     await query.answer()
-    tid      = str(update.effective_user.id)
-    user_db  = get_user_db_id(tid)
-    robot_id = get_robot_id_for_user(user_db)
-    data     = query.data
+    telegram_id = str(update.effective_user.id)
+    user_db_id = get_user_db_id(telegram_id)
+    robot_id = get_robot_id_for_user(user_db_id)
 
-    if data == "start_scan":
-        set_command(robot_id, "start", None)
-        await query.message.reply_text("Сканування розпочато.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Стоп", callback_data="stop_scan")]]))
+    if query.data == "start_scan":
+        scan_status[robot_id] = "start"
+        await query.message.reply_text(
+            "Сканування розпочато.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Завершити сканування", callback_data="stop_scan")]]
+            )
+        )
         return
 
-    if data == "stop_scan":
-        set_command(robot_id, "stop", None)
+    if query.data == "stop_scan":
+        scan_status[robot_id] = "stop"
         await query.message.reply_text("Сканування зупинено.", reply_markup=get_main_menu())
         return
 
-    if data == "add_plant":
+    if query.data == "add_plant":
         return await add_plant_start(update, context)
 
-    if data == "view_plants":
-        plants = get_all_plants(user_db)
+    if query.data == "view_plants":
+        await show_plants_actions(query, context, user_db_id)
+        return
+
+    if query.data.startswith("view_qr:"):
+        plant_id = query.data.split(":", 1)[1]
+        qr_msg_id = get_qr_message_id(plant_id)
+        chat_id = query.message.chat_id
+        await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=chat_id,
+            message_id=qr_msg_id
+        )
+        return
+
+    if query.data == "return_menu":
+        await query.message.reply_text("Оберіть дію:", reply_markup=get_main_menu())
+        return
+
+    if query.data == "delete_plant":
+        plants = get_all_plants(user_db_id)
+        buttons = [
+            [InlineKeyboardButton(f"{p['species']} ({p['location']})",
+                                 callback_data=f"prompt_delete:{p['plant_id']}")]
+            for p in plants
+        ]
+        menu_msg = await query.message.reply_text("Оберіть томат для видалення:",
+                                                 reply_markup=InlineKeyboardMarkup(buttons))
+        context.user_data['plants_menu_msg_id'] = menu_msg.message_id
+        return
+
+    if query.data.startswith("prompt_delete:"):
+        plant_id = query.data.split(":", 1)[1]
+        species = next((p['species'] for p in get_all_plants(user_db_id) if p['plant_id'] == plant_id), "")
+        confirm = await query.message.reply_text(
+            f"Ви дійсно хочете видалити рослину «{species}»?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Так", callback_data=f"delete_yes:{plant_id}"),
+                InlineKeyboardButton("Ні", callback_data="delete_no")
+            ]])
+        )
+        context.user_data['confirm_msg_id'] = confirm.message_id
+        return
+
+    if query.data.startswith("delete_yes:"):
+        plant_id = query.data.split(":", 1)[1]
+        delete_plant(user_db_id, plant_id)
+        await context.bot.delete_message(query.message.chat_id, context.user_data.pop('plants_menu_msg_id'))
+        await context.bot.delete_message(query.message.chat_id, context.user_data.pop('confirm_msg_id'))
+        await show_plants_actions(query, context, user_db_id)
+        return
+
+    if query.data == "delete_no":
+        chat_id = query.message.chat_id
+        await context.bot.delete_message(chat_id, context.user_data.pop('plants_menu_msg_id'))
+        await context.bot.delete_message(chat_id, context.user_data.pop('confirm_msg_id'))
+        await query.message.reply_text("Видалення скасовано.", reply_markup=plant_list_menu())
+        return
+
+    if query.data == "history":
+        plants = get_all_plants(user_db_id)
         if not plants:
-            await query.message.reply_text("Рослин немає.", reply_markup=get_main_menu())
+            await query.message.reply_text("У вас ще немає доданих рослин.", reply_markup=get_main_menu())
             return
-        for p in plants:
-            btn = InlineKeyboardButton("QR-код", callback_data=f"view_qr:{p['plant_id']}")
-            txt = f"{p['species']} @ {p['location']}"
-            await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[btn]]))
-        await query.message.reply_text("Дії:", reply_markup=plant_list_menu())
+        buttons = [[
+            InlineKeyboardButton(f"{p['species']} ({p['location']})",
+                                callback_data=f"view_history:{p['plant_id']}")
+        ] for p in plants]
+        await query.message.reply_text(
+            "Виберіть рослину, історію якої хочете переглянути:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
         return
 
-    if data.startswith("view_qr:"):
-        pid = data.split(":",1)[1]
-        mid = get_qr_message_id(pid)
-        await context.bot.copy_message(chat_id=query.message.chat_id,
-            from_chat_id=query.message.chat_id, message_id=mid)
-        return
-
-    if data == "return_menu":
-        await query.message.reply_text("Меню:", reply_markup=get_main_menu())
-        return
-
-    if data == "delete_plant":
-        plants = get_all_plants(user_db)
-        btns = [[InlineKeyboardButton(f"{p['species']} @ {p['location']}", callback_data=f"del:{p['plant_id']}")] for p in plants]
-        await query.message.reply_text("Оберіть для видалення:", reply_markup=InlineKeyboardMarkup(btns))
-        return
-
-    if data.startswith("del:"):
-        pid = data.split(":",1)[1]
-        delete_plant(user_db, pid)
-        await query.message.reply_text("Видалено.", reply_markup=get_main_menu())
-        return
-
-    if data == "history":
-        plants = get_all_plants(user_db)
-        btns = [[InlineKeyboardButton(f"{p['species']} @ {p['location']}", callback_data=f"hist:{p['plant_id']}")] for p in plants]
-        await query.message.reply_text("Історія:", reply_markup=InlineKeyboardMarkup(btns))
-        return
-
-    if data.startswith("hist:"):
-        pid   = data.split(":",1)[1]
-        scans = get_scan_history(pid)
+    if query.data.startswith("view_history:"):
+        plant_id = query.data.split(":", 1)[1]
+        scans = get_scan_history(plant_id)
         if not scans:
-            await query.message.reply_text("Немає сканів.", reply_markup=get_main_menu())
+            await query.message.reply_text("Сканувань ще немає.", reply_markup=get_main_menu())
             return
-        for s in scans:
-            ds = s.get("diseases") or []
-            txt = ", ".join(f"{d['name']}({d['probability']*100:.1f}%)" for d in ds) or "Немає"
-            cap = f"{s['plants']['species']} @ {s['timestamp']}\n{txt}"
-            await query.message.reply_photo(photo=s['image_url'], caption=cap)
-        await query.message.reply_text("Готово", reply_markup=get_main_menu())
+        for scan in scans:
+            plant = scan["plants"]
+            diseases = scan["diseases"] or []
+            diseases_text = ", ".join(f"{d['name']} ({d['probability']*100:.1f}%)" for d in diseases) or "Немає хвороб"
+            caption = (
+                f"Рослина: {plant['species']}\n"
+                f"Локація: {plant['location']}\n"
+                f"Хвороби: {diseases_text}\n"
+                f"Час: {scan['timestamp']}"
+            )
+            await query.message.reply_photo(photo=scan["image_url"], caption=caption)
+        await query.message.reply_text("Оберіть дію:", reply_markup=get_main_menu())
         return
 
 @app.get("/api/get_user")
 async def get_user(robot_id: str):
-    tid = get_telegram_id_by_robot(robot_id)
-    if not tid:
-        raise HTTPException(404, "Не знайдено")
-    return {"telegram_id": tid}
+    telegram_id = get_telegram_id_by_robot(robot_id)
+    if not telegram_id:
+        raise HTTPException(status_code=404, detail="Робоплатформа не знайдена")
+    return {"telegram_id": telegram_id}
 
 @app.post("/api/scan")
 async def receive_scan(data: ScanData):
-    tid = get_telegram_id_by_robot(data.robot_id)
-    if not tid:
-        raise HTTPException(404, "Не знайдено")
+    telegram_id = get_telegram_id_by_robot(data.robot_id)
+    if not telegram_id:
+        raise HTTPException(status_code=404, detail="Робоплатформа не знайдена")
 
-    img = base64.b64decode(data.image)
-    im  = Image.open(io.BytesIO(img))
-    fn  = f"scan_{data.robot_id}_{data.timestamp.replace(' ','_')}.jpg"
-    buf = io.BytesIO(); im.save(buf, format="JPEG"); buf.seek(0)
- 
-    url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/plant_images/{fn}"
+    image_data = base64.b64decode(data.image)
+    image = Image.open(io.BytesIO(image_data))
+    filename = f"scan_{data.robot_id}_{data.timestamp.replace(' ', '_')}.jpg"
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG")
+    buf.seek(0)
+    supabase.storage.from_("plant_images").upload(filename, buf)
+    url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/plant_images/{filename}"
 
-    insert_scan(data.robot_id, data.analysis.get("plant_id"), data.analysis.get("diseases", []), data.timestamp, url)
+    insert_scan(
+        data.robot_id,
+        data.analysis.get("plant_id"),
+        data.analysis.get("diseases", []),
+        data.timestamp,
+        url
+    )
 
-    await telegram_bot.send_photo(chat_id=tid, photo=url,
-        caption=f"Скан: {data.timestamp}")
-    clear_command(data.robot_id)
-    return {"status": "ok"}
+    plant = next((p for p in get_all_plants(get_user_db_id(telegram_id)) if p["plant_id"] == data.analysis.get("plant_id")), None)
+    species = plant["species"] if plant else "Невідомо"
+    location = plant["location"] if plant else "Невідомо"
+    diseases = data.analysis.get("diseases", []) or []
+    diseases_text = ", ".join(f"{d['name']} ({d['probability']*100:.1f}%)" for d in diseases) or "Немає хвороб"
+    caption = (
+        f"Нове сканування:\n"
+        f"Рослина: {species}\n"
+        f"Локація: {location}\n"
+        f"Хвороби: {diseases_text}\n"
+        f"Час: {data.timestamp}"
+    )
+    await Application.builder().token(BOT_TOKEN).build().bot.send_photo(
+        chat_id=telegram_id,
+        photo=url,
+        caption=caption
+    )
+    return {"status": "success"}
 
+@app.post("/api/scan_status")
+async def get_scan_status(data: dict):
+    robot_id = data.get("robot_id")
+    if not robot_id or robot_id not in scan_status:
+        raise HTTPException(status_code=404, detail="Робоплатформа не знайдена")
+    return {"status": scan_status[robot_id]}
 
-if __name__ == "__main__":
+@app.post("/api/update_status")
+async def update_status(data: dict):
+    robot_id = data.get("robot_id")
+    status = data.get("status")
+    reason = data.get("reason", "manual")
+    if not robot_id or robot_id not in scan_status:
+        raise HTTPException(status_code=404, detail="Робоплатформа не знайдена")
+    scan_status[robot_id] = status
+    if status == "stop":
+        telegram_id = get_telegram_id_by_robot(robot_id)
+        if telegram_id:
+            if reason == "end_of_route":
+                msg = "Робоплатформа зупинилася: кінець маршруту або втрата лінії."
+            elif reason == "obstacle":
+                msg = "Робоплатформа зупинилася: виявлено перешкоду на відстані менше 10 см."
+            else:
+                msg = "Робоплатформа зупинилася."
+            await Application.builder().token(BOT_TOKEN).build().bot.send_message(
+                chat_id=telegram_id,
+                text=msg,
+                reply_markup=get_main_menu()
+            )
+    return {"status": "updated"}
+
+def main():
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+
     conv_bind = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_bind, pattern="bind_robot")],
         states={BIND_ROBOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_input)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)]
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
     )
     conv_plant = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_plant_start, pattern="add_plant")],
-        states={SPECIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, species_input)],
-                LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, location_input)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)]
+        states={
+            SPECIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, species_input)],
+            LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, location_input)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
     )
 
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(conv_bind)
     app_bot.add_handler(conv_plant)
     app_bot.add_handler(CallbackQueryHandler(button))
-
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
     app_bot.run_polling()
+
+if __name__ == "__main__":
+    main()
