@@ -42,27 +42,21 @@ from db import (
 )
 from models import ScanData
 
-# Логування
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Завантаження змінних середовища
 load_dotenv()
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
-# URL бота для виклику в роботі (наприклад, для помилок)
 
-# Ініціалізація FastAPI і Telegram-бота
 app        = FastAPI()
 app_bot    = Application.builder().token(BOT_TOKEN).build()
 telegram_bot = app_bot.bot
 
-# Стани для діалогів
 SPECIES, LOCATION, BIND_ROBOT = range(3)
 
-# Клавіатури
 
 def get_main_menu():
     return InlineKeyboardMarkup([
@@ -80,9 +74,6 @@ def plant_list_menu():
         ]
     ])
 
-# —————————————————————————————————————————
-#      Telegram-обробники
-# —————————————————————————————————————————
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid       = str(update.effective_user.id)
     username  = update.effective_user.username or ""
@@ -107,7 +98,6 @@ async def bind_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_db  = get_user_db_id(tid)
     robot_id = update.message.text.strip()
 
-    # Прив'язуємо без перевірки — вважатимемо, що код коректний
     bind_robot_to_user(user_db, robot_id)
     await update.message.reply_text(f"Робота {robot_id} прив'язано!", reply_markup=get_main_menu())
     return ConversationHandler.END
@@ -224,9 +214,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Готово", reply_markup=get_main_menu())
         return
 
-# —————————————————————————————————————————
-#  REST для робота
-# —————————————————————————————————————————
 @app.get("/api/get_user")
 async def get_user(robot_id: str):
     tid = get_telegram_id_by_robot(robot_id)
@@ -244,22 +231,17 @@ async def receive_scan(data: ScanData):
     im  = Image.open(io.BytesIO(img))
     fn  = f"scan_{data.robot_id}_{data.timestamp.replace(' ','_')}.jpg"
     buf = io.BytesIO(); im.save(buf, format="JPEG"); buf.seek(0)
-    # завантаження у Supabase виконує insert_scan через тригери або окремий скрипт
-    # а self-same url формування лишається тут
+ 
     url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/plant_images/{fn}"
 
     insert_scan(data.robot_id, data.analysis.get("plant_id"), data.analysis.get("diseases", []), data.timestamp, url)
 
-    # надсилаємо фото юзеру
     await telegram_bot.send_photo(chat_id=tid, photo=url,
         caption=f"Скан: {data.timestamp}")
-    # очищуємо команду після скану
     clear_command(data.robot_id)
     return {"status": "ok"}
 
-# —————————————————————————————————————————
-#  Запуск
-# —————————————————————————————————————————
+
 if __name__ == "__main__":
     conv_bind = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_bind, pattern="bind_robot")],
