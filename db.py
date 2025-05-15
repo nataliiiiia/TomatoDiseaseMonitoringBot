@@ -75,26 +75,6 @@ def get_qr_message_id(plant_id: str) -> Optional[int]:
     resp = supabase.table("plants").select("qr_message_id").eq("plant_id", plant_id).execute()
     return resp.data[0]["qr_message_id"] if resp.data and resp.data[0].get("qr_message_id") else None
 
-def set_scan_status(robot_id: str, status: str) -> None:
-    supabase.table("scan_status").upsert({"robot_id": robot_id, "status": status}).execute()
-
-def get_scan_status(robot_id: str) -> Optional[str]:
-    resp = supabase.table("scan_status").select("status").eq("robot_id", robot_id).execute()
-    return resp.data[0]["status"] if resp.data else "stop"
-
-def insert_scan(robot_id: str,
-                plant_id: Optional[str],
-                diseases: List[Dict],
-                timestamp: str,
-                image_url: str) -> None:
-    supabase.table("scans").insert({
-        "robot_id": robot_id,
-        "plant_id": plant_id,
-        "diseases": diseases,
-        "timestamp": timestamp,
-        "image_url": image_url
-    }).execute()
-
 def get_scan_history(plant_id: str, limit: int = 5) -> List[Dict]:
     resp = (
         supabase.table("scans")
@@ -102,6 +82,33 @@ def get_scan_history(plant_id: str, limit: int = 5) -> List[Dict]:
         .eq("plant_id", plant_id)
         .order("timestamp", desc=True)
         .limit(limit)
+        .execute()
+    )
+    return resp.data or []
+
+def get_scan_timestamps(user_db_id: str) -> List[str]:
+    robot_id = get_robot_id_for_user(user_db_id)
+    if not robot_id:
+        return []
+    resp = (
+        supabase.table("scans")
+        .select("timestamp")
+        .eq("robot_id", robot_id)
+        .order("timestamp", desc=True)
+        .limit(10)
+        .execute()
+    )
+    return [row["timestamp"] for row in resp.data] or []
+
+def get_scans_by_timestamp(user_db_id: str, timestamp: str) -> List[Dict]:
+    robot_id = get_robot_id_for_user(user_db_id)
+    if not robot_id:
+        return []
+    resp = (
+        supabase.table("scans")
+        .select("*, plants(species, location)")
+        .eq("robot_id", robot_id)
+        .eq("timestamp", timestamp)
         .execute()
     )
     return resp.data or []
