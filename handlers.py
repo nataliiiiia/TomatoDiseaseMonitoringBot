@@ -264,10 +264,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Хвороби: {diseases_text}\n"
                 f"Час: {ts}")
             await query.message.reply_photo(photo=scan["image_url"], caption=caption)
-
-        await query.message.edit_text(
-            "Оберіть дію:",
-            reply_markup=get_main_menu())
+        await query.message.reply_text("Оберіть дію:", reply_markup=get_main_menu())
         return
 
     elif query.data.startswith("view_history:"):
@@ -288,5 +285,5 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Хвороби: {diseases_text}\n"
                 f"Час: {ts}")
             await query.message.reply_photo(photo=scan["image_url"], caption=caption)
-        await query.message.edit_text("Оберіть дію:", reply_markup=get_main_menu())
+        await query.message.reply_text("Оберіть дію:", reply_markup=get_main_menu())
         return
