@@ -5,8 +5,3 @@ class ScanData(BaseModel):
     image: str
     analysis: dict
     timestamp: str
-
-class CommandData(BaseModel):
-    robot_id: str
-    command: str
-    reason: str = "manual"
